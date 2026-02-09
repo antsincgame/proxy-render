@@ -18,23 +18,19 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// ─── Info page ───────────────────────────────────────────
-app.get('/', (_req, res) => {
+// ─── Info / docs ─────────────────────────────────────────
+app.get('/', (req, res) => {
+  const host = req.headers['x-forwarded-host'] || req.headers.host || 'proxy-render-kb84.onrender.com';
   res.json({
     service: 'proxy-render',
-    version: '2.0.0',
-    mode: 'HTTP Forward Proxy + API Relay',
-    usage: {
-      forward_proxy: {
-        description: 'Use as HTTP proxy in your app settings',
-        host: 'proxy-render-kb84.onrender.com',
-        port: 443,
-        protocol: 'HTTP/HTTPS',
-      },
-      api_relay: {
-        description: 'Or use /proxy?url=TARGET endpoint directly',
-        example: '/proxy?url=https://api.openai.com/v1/models',
-      },
+    version: '3.0.0',
+    mode: 'API Gateway / Relay Proxy',
+    endpoints: {
+      openai:     `https://${host}/openai/v1/...`,
+      openrouter: `https://${host}/openrouter/api/v1/...`,
+      perplexity: `https://${host}/perplexity/...`,
+      anthropic:  `https://${host}/anthropic/v1/...`,
+      generic:    `https://${host}/proxy?url=https://any-api.com/path`,
     },
     health: '/health',
   });
@@ -46,7 +42,6 @@ function proxyRequest(targetUrl, req, res) {
     return res.status(400).json({ error: 'Missing target URL' });
   }
 
-  // Ensure protocol
   if (!/^https?:\/\//i.test(targetUrl)) {
     targetUrl = 'https://' + targetUrl;
   }
@@ -58,12 +53,13 @@ function proxyRequest(targetUrl, req, res) {
     return res.status(400).json({ error: 'Invalid URL: ' + targetUrl });
   }
 
-  // Build outgoing headers
+  // Build outgoing headers — forward everything relevant
   const skipHeaders = new Set([
     'host', 'connection', 'keep-alive', 'transfer-encoding',
     'x-target-url', 'x-api-key', 'x-forwarded-for',
     'x-forwarded-proto', 'x-forwarded-host', 'x-render-origin-server',
     'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'cdn-loop',
+    'rndr-id', 'render-proxy-ttl',
   ]);
 
   const outHeaders = {};
@@ -83,7 +79,7 @@ function proxyRequest(targetUrl, req, res) {
     path: fullPath,
     method: req.method,
     headers: outHeaders,
-    timeout: 60000,
+    timeout: 120000,
   };
 
   console.log(`[PROXY] ${req.method} -> ${parsed.origin}${fullPath}`);
@@ -122,12 +118,42 @@ function proxyRequest(targetUrl, req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  MODE 1: Forward proxy (full URL in request line)
-//  PHP cURL sends: GET http://api.openai.com/v1/models HTTP/1.1
+//  API GATEWAY ROUTES
+//  Replace base URL in your app settings with proxy URL
 // ═══════════════════════════════════════════════════════════
 
+// OpenAI: https://api.openai.com/v1/... → /openai/v1/...
+app.all('/openai/*', (req, res) => {
+  const path = req.originalUrl.replace(/^\/openai/, '');
+  proxyRequest('https://api.openai.com' + path, req, res);
+});
+
+// OpenRouter: https://openrouter.ai/api/v1/... → /openrouter/api/v1/...
+app.all('/openrouter/*', (req, res) => {
+  const path = req.originalUrl.replace(/^\/openrouter/, '');
+  proxyRequest('https://openrouter.ai' + path, req, res);
+});
+
+// Perplexity: https://api.perplexity.ai/... → /perplexity/...
+app.all('/perplexity/*', (req, res) => {
+  const path = req.originalUrl.replace(/^\/perplexity/, '');
+  proxyRequest('https://api.perplexity.ai' + path, req, res);
+});
+
+// Anthropic: https://api.anthropic.com/v1/... → /anthropic/v1/...
+app.all('/anthropic/*', (req, res) => {
+  const path = req.originalUrl.replace(/^\/anthropic/, '');
+  proxyRequest('https://api.anthropic.com' + path, req, res);
+});
+
+// Google Gemini: https://generativelanguage.googleapis.com/... → /gemini/...
+app.all('/gemini/*', (req, res) => {
+  const path = req.originalUrl.replace(/^\/gemini/, '');
+  proxyRequest('https://generativelanguage.googleapis.com' + path, req, res);
+});
+
 // ═══════════════════════════════════════════════════════════
-//  MODE 2: API Relay — /proxy?url=... or /proxy/https://...
+//  GENERIC PROXY — /proxy?url=TARGET or /proxy/https://...
 // ═══════════════════════════════════════════════════════════
 app.all('/proxy', (req, res) => {
   const targetUrl = req.headers['x-target-url'] || req.query.url;
@@ -141,72 +167,28 @@ app.all('/proxy/*', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  MODE 3: Catch-all for forward proxy requests
-//  When configured as proxy, requests come as full URLs or
-//  with X-Target-URL header on any path
+//  CATCH-ALL — X-Target-URL header relay
 // ═══════════════════════════════════════════════════════════
 app.all('*', (req, res) => {
-  // Check if this is a forward proxy request (full URL in path)
-  const originalUrl = req.originalUrl || req.url;
-
-  // Forward proxy: full URL as request path
-  if (/^https?:\/\//i.test(originalUrl)) {
-    return proxyRequest(originalUrl, req, res);
-  }
-
-  // X-Target-URL header present — relay mode
   if (req.headers['x-target-url']) {
     const base = req.headers['x-target-url'].replace(/\/$/, '');
-    const path = originalUrl;
-    return proxyRequest(base + path, req, res);
+    return proxyRequest(base + req.originalUrl, req, res);
   }
 
-  // Not a proxy request
   res.status(404).json({
-    error: 'Not a proxy request',
-    hint: 'Use /proxy?url=TARGET or set X-Target-URL header',
+    error: 'Unknown route',
+    hint: 'Use /openai/..., /openrouter/..., /perplexity/..., /anthropic/..., /gemini/... or /proxy?url=TARGET',
   });
-});
-
-// ─── Create HTTP server for CONNECT support ──────────────
-const server = http.createServer(app);
-
-// Handle CONNECT method (for HTTPS through forward proxy)
-server.on('connect', (req, clientSocket, head) => {
-  console.log(`[CONNECT] ${req.url}`);
-
-  const [hostname, port] = req.url.split(':');
-  const targetPort = parseInt(port) || 443;
-
-  const serverSocket = require('net').connect(targetPort, hostname, () => {
-    clientSocket.write(
-      'HTTP/1.1 200 Connection Established\r\n' +
-      'Proxy-Agent: proxy-render\r\n' +
-      '\r\n'
-    );
-    serverSocket.write(head);
-    serverSocket.pipe(clientSocket);
-    clientSocket.pipe(serverSocket);
-  });
-
-  serverSocket.on('error', (err) => {
-    console.error(`[CONNECT ERROR] ${hostname}:${targetPort}`, err.message);
-    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-    clientSocket.end();
-  });
-
-  clientSocket.on('error', () => serverSocket.destroy());
-  serverSocket.on('timeout', () => {
-    serverSocket.destroy();
-    clientSocket.end();
-  });
-  serverSocket.setTimeout(60000);
 });
 
 // ─── Start ───────────────────────────────────────────────
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✓ Proxy server v2.0 running on port ${PORT}`);
-  console.log(`  Health:   http://localhost:${PORT}/health`);
-  console.log(`  Relay:    http://localhost:${PORT}/proxy?url=TARGET`);
-  console.log(`  Forward:  Configure as HTTP proxy — host:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✓ Proxy API Gateway v3.0 running on port ${PORT}`);
+  console.log(`  Health:     http://localhost:${PORT}/health`);
+  console.log(`  OpenAI:     http://localhost:${PORT}/openai/v1/...`);
+  console.log(`  OpenRouter: http://localhost:${PORT}/openrouter/api/v1/...`);
+  console.log(`  Perplexity: http://localhost:${PORT}/perplexity/...`);
+  console.log(`  Anthropic:  http://localhost:${PORT}/anthropic/v1/...`);
+  console.log(`  Gemini:     http://localhost:${PORT}/gemini/...`);
+  console.log(`  Generic:    http://localhost:${PORT}/proxy?url=TARGET`);
 });
