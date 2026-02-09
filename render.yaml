@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: proxy-render
+    runtime: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_KEY
+        sync: false  # set manually in Render dashboard
+      - key: ALLOWED_ORIGINS
+        value: "*"
