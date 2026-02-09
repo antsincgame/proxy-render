@@ -7,32 +7,11 @@ const { URL } = require('url');
 
 // ─── Config ──────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
-const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
-  : ['*'];
-const API_KEY = process.env.API_KEY || ''; // optional auth
+const API_KEY = process.env.API_KEY || '';
 
 const app = express();
-
-// ─── Middleware ───────────────────────────────────────────
 app.use(morgan('short'));
-app.use(cors({
-  origin: ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Target-URL', 'X-API-Key'],
-  exposedHeaders: ['Content-Length', 'Content-Type'],
-}));
-
-// Parse raw body to forward it
-app.use(express.raw({ type: '*/*', limit: '50mb' }));
-
-// ─── Auth check (optional) ──────────────────────────────
-function checkAuth(req, res, next) {
-  if (!API_KEY) return next(); // no key set — skip auth
-  const provided = req.headers['x-api-key'] || req.query.apikey;
-  if (provided === API_KEY) return next();
-  return res.status(403).json({ error: 'Forbidden: invalid API key' });
-}
+app.use(cors({ origin: '*' }));
 
 // ─── Health check ────────────────────────────────────────
 app.get('/health', (_req, res) => {
@@ -43,40 +22,28 @@ app.get('/health', (_req, res) => {
 app.get('/', (_req, res) => {
   res.json({
     service: 'proxy-render',
-    version: '1.0.0',
+    version: '2.0.0',
+    mode: 'HTTP Forward Proxy + API Relay',
     usage: {
-      method1_header: {
-        description: 'Pass target URL via X-Target-URL header',
-        example: 'curl -H "X-Target-URL: https://api.example.com/data" https://YOUR-PROXY.onrender.com/proxy',
+      forward_proxy: {
+        description: 'Use as HTTP proxy in your app settings',
+        host: 'proxy-render-kb84.onrender.com',
+        port: 443,
+        protocol: 'HTTP/HTTPS',
       },
-      method2_query: {
-        description: 'Pass target URL via ?url= query parameter',
-        example: 'curl "https://YOUR-PROXY.onrender.com/proxy?url=https://api.example.com/data"',
-      },
-      method3_path: {
-        description: 'Pass target URL as path after /proxy/',
-        example: 'curl "https://YOUR-PROXY.onrender.com/proxy/https://api.example.com/data"',
+      api_relay: {
+        description: 'Or use /proxy?url=TARGET endpoint directly',
+        example: '/proxy?url=https://api.openai.com/v1/models',
       },
     },
     health: '/health',
   });
 });
 
-// ─── Main proxy endpoint ─────────────────────────────────
-app.all('/proxy', checkAuth, handleProxy);
-app.all('/proxy/*', checkAuth, handleProxy);
-
-function handleProxy(req, res) {
-  // 1. Determine target URL
-  let targetUrl =
-    req.headers['x-target-url'] ||
-    req.query.url ||
-    extractPathUrl(req.path);
-
+// ─── Universal proxy handler ─────────────────────────────
+function proxyRequest(targetUrl, req, res) {
   if (!targetUrl) {
-    return res.status(400).json({
-      error: 'Missing target URL. Use X-Target-URL header, ?url= query, or /proxy/https://...',
-    });
+    return res.status(400).json({ error: 'Missing target URL' });
   }
 
   // Ensure protocol
@@ -88,14 +55,17 @@ function handleProxy(req, res) {
   try {
     parsed = new URL(targetUrl);
   } catch {
-    return res.status(400).json({ error: 'Invalid target URL: ' + targetUrl });
+    return res.status(400).json({ error: 'Invalid URL: ' + targetUrl });
   }
 
-  // 2. Build outgoing headers (forward most, skip hop-by-hop)
+  // Build outgoing headers
   const skipHeaders = new Set([
     'host', 'connection', 'keep-alive', 'transfer-encoding',
-    'x-target-url', 'x-api-key',
+    'x-target-url', 'x-api-key', 'x-forwarded-for',
+    'x-forwarded-proto', 'x-forwarded-host', 'x-render-origin-server',
+    'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'cdn-loop',
   ]);
+
   const outHeaders = {};
   for (const [key, value] of Object.entries(req.headers)) {
     if (!skipHeaders.has(key.toLowerCase())) {
@@ -104,18 +74,8 @@ function handleProxy(req, res) {
   }
   outHeaders['host'] = parsed.host;
 
-  // Forward query params from original request (merge)
-  const proxyParams = new URLSearchParams(parsed.search);
-  for (const [k, v] of Object.entries(req.query)) {
-    if (k !== 'url' && k !== 'apikey') {
-      proxyParams.set(k, v);
-    }
-  }
-  const queryString = proxyParams.toString();
-  const fullPath = parsed.pathname + (queryString ? '?' + queryString : '');
-
-  // 3. Make the request
   const transport = parsed.protocol === 'https:' ? https : http;
+  const fullPath = parsed.pathname + parsed.search;
 
   const options = {
     hostname: parsed.hostname,
@@ -123,16 +83,14 @@ function handleProxy(req, res) {
     path: fullPath,
     method: req.method,
     headers: outHeaders,
-    timeout: 30000,
+    timeout: 60000,
   };
 
   console.log(`[PROXY] ${req.method} -> ${parsed.origin}${fullPath}`);
 
   const proxyReq = transport.request(options, (proxyRes) => {
-    // Forward status & headers
     const responseHeaders = { ...proxyRes.headers };
-    delete responseHeaders['transfer-encoding']; // let express handle it
-
+    delete responseHeaders['transfer-encoding'];
     res.writeHead(proxyRes.statusCode, responseHeaders);
     proxyRes.pipe(res);
   });
@@ -151,25 +109,104 @@ function handleProxy(req, res) {
     }
   });
 
-  // Send body if present
-  if (req.body && req.body.length > 0) {
-    proxyReq.write(req.body);
+  // Collect and forward body
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    if (chunks.length > 0) {
+      proxyReq.write(Buffer.concat(chunks));
+    }
+    proxyReq.end();
+  });
+  req.on('error', () => proxyReq.destroy());
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MODE 1: Forward proxy (full URL in request line)
+//  PHP cURL sends: GET http://api.openai.com/v1/models HTTP/1.1
+// ═══════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════
+//  MODE 2: API Relay — /proxy?url=... or /proxy/https://...
+// ═══════════════════════════════════════════════════════════
+app.all('/proxy', (req, res) => {
+  const targetUrl = req.headers['x-target-url'] || req.query.url;
+  proxyRequest(targetUrl, req, res);
+});
+
+app.all('/proxy/*', (req, res) => {
+  const match = req.path.match(/^\/proxy\/(.+)/);
+  const targetUrl = match ? decodeURIComponent(match[1]) : null;
+  proxyRequest(targetUrl, req, res);
+});
+
+// ═══════════════════════════════════════════════════════════
+//  MODE 3: Catch-all for forward proxy requests
+//  When configured as proxy, requests come as full URLs or
+//  with X-Target-URL header on any path
+// ═══════════════════════════════════════════════════════════
+app.all('*', (req, res) => {
+  // Check if this is a forward proxy request (full URL in path)
+  const originalUrl = req.originalUrl || req.url;
+
+  // Forward proxy: full URL as request path
+  if (/^https?:\/\//i.test(originalUrl)) {
+    return proxyRequest(originalUrl, req, res);
   }
-  proxyReq.end();
-}
 
-// Extract URL from path: /proxy/https://example.com/path -> https://example.com/path
-function extractPathUrl(path) {
-  const match = path.match(/^\/proxy\/(.+)/);
-  if (match) return decodeURIComponent(match[1]);
-  return null;
-}
+  // X-Target-URL header present — relay mode
+  if (req.headers['x-target-url']) {
+    const base = req.headers['x-target-url'].replace(/\/$/, '');
+    const path = originalUrl;
+    return proxyRequest(base + path, req, res);
+  }
 
-// ─── Start server ────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✓ Proxy server running on port ${PORT}`);
-  console.log(`  Health: http://localhost:${PORT}/health`);
-  console.log(`  Proxy:  http://localhost:${PORT}/proxy?url=TARGET`);
-  if (API_KEY) console.log('  Auth:   API key required (X-API-Key header)');
-  else console.log('  Auth:   OPEN (set API_KEY env to protect)');
+  // Not a proxy request
+  res.status(404).json({
+    error: 'Not a proxy request',
+    hint: 'Use /proxy?url=TARGET or set X-Target-URL header',
+  });
+});
+
+// ─── Create HTTP server for CONNECT support ──────────────
+const server = http.createServer(app);
+
+// Handle CONNECT method (for HTTPS through forward proxy)
+server.on('connect', (req, clientSocket, head) => {
+  console.log(`[CONNECT] ${req.url}`);
+
+  const [hostname, port] = req.url.split(':');
+  const targetPort = parseInt(port) || 443;
+
+  const serverSocket = require('net').connect(targetPort, hostname, () => {
+    clientSocket.write(
+      'HTTP/1.1 200 Connection Established\r\n' +
+      'Proxy-Agent: proxy-render\r\n' +
+      '\r\n'
+    );
+    serverSocket.write(head);
+    serverSocket.pipe(clientSocket);
+    clientSocket.pipe(serverSocket);
+  });
+
+  serverSocket.on('error', (err) => {
+    console.error(`[CONNECT ERROR] ${hostname}:${targetPort}`, err.message);
+    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    clientSocket.end();
+  });
+
+  clientSocket.on('error', () => serverSocket.destroy());
+  serverSocket.on('timeout', () => {
+    serverSocket.destroy();
+    clientSocket.end();
+  });
+  serverSocket.setTimeout(60000);
+});
+
+// ─── Start ───────────────────────────────────────────────
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✓ Proxy server v2.0 running on port ${PORT}`);
+  console.log(`  Health:   http://localhost:${PORT}/health`);
+  console.log(`  Relay:    http://localhost:${PORT}/proxy?url=TARGET`);
+  console.log(`  Forward:  Configure as HTTP proxy — host:${PORT}`);
 });
