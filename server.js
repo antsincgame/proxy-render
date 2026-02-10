@@ -7,13 +7,44 @@ const { URL } = require('url');
 
 // ─── Config ──────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
-const API_KEY = process.env.API_KEY || '';
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD || '';
 
 const app = express();
 app.use(morgan('short'));
 app.use(cors({ origin: '*' }));
 
-// ─── Health check ────────────────────────────────────────
+// ─── Password protection ──────────────────────────────────
+function requirePassword(req, res, next) {
+  if (!PROXY_PASSWORD) return next();
+  if (req.path === '/' || req.path === '/health') return next();
+
+  let provided =
+    req.headers['x-proxy-password'] ||
+    req.query.password ||
+    (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')
+      ? req.headers.authorization.slice(7)
+      : '');
+
+  // Basic Auth: логин может быть любой, пароль должен совпадать
+  if (!provided && req.headers.authorization && req.headers.authorization.startsWith('Basic ')) {
+    try {
+      const decoded = Buffer.from(req.headers.authorization.slice(6), 'base64').toString('utf8');
+      const password = decoded.includes(':') ? decoded.split(':')[1] : decoded;
+      provided = password;
+    } catch (_) {}
+  }
+
+  if (provided === PROXY_PASSWORD) return next();
+
+  res.status(401).json({
+    error: 'Unauthorized',
+    message: 'Укажите пароль: X-Proxy-Password, ?password=..., Basic Auth или Bearer',
+  });
+}
+
+app.use(requirePassword);
+
+// ─── Health check (без пароля для мониторинга Render) ─────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
@@ -25,6 +56,7 @@ app.get('/', (req, res) => {
     service: 'proxy-render',
     version: '3.0.0',
     mode: 'API Gateway / Relay Proxy',
+    auth: PROXY_PASSWORD ? 'Пароль обязателен: X-Proxy-Password или ?password=...' : 'Выключена',
     endpoints: {
       openai:     `https://${host}/openai/v1/...`,
       openrouter: `https://${host}/openrouter/api/v1/...`,
@@ -53,10 +85,10 @@ function proxyRequest(targetUrl, req, res) {
     return res.status(400).json({ error: 'Invalid URL: ' + targetUrl });
   }
 
-  // Build outgoing headers — forward everything relevant
+  // Build outgoing headers — forward everything relevant (не пробрасываем пароль прокси)
   const skipHeaders = new Set([
     'host', 'connection', 'keep-alive', 'transfer-encoding',
-    'x-target-url', 'x-api-key', 'x-forwarded-for',
+    'x-target-url', 'x-api-key', 'x-proxy-password', 'x-forwarded-for',
     'x-forwarded-proto', 'x-forwarded-host', 'x-render-origin-server',
     'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'cdn-loop',
     'rndr-id', 'render-proxy-ttl',
@@ -64,14 +96,17 @@ function proxyRequest(targetUrl, req, res) {
 
   const outHeaders = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    if (!skipHeaders.has(key.toLowerCase())) {
-      outHeaders[key] = value;
-    }
+    if (skipHeaders.has(key.toLowerCase())) continue;
+    // Basic Auth использовался для пароля прокси — не слать в целевой API
+    if (key.toLowerCase() === 'authorization' && (value || '').startsWith('Basic ')) continue;
+    outHeaders[key] = value;
   }
   outHeaders['host'] = parsed.host;
 
   const transport = parsed.protocol === 'https:' ? https : http;
-  const fullPath = parsed.pathname + parsed.search;
+  // убираем пароль прокси из query, чтобы не слать его в целевой API
+  parsed.searchParams.delete('password');
+  const fullPath = parsed.pathname + (parsed.search || '');
 
   const options = {
     hostname: parsed.hostname,
@@ -184,6 +219,7 @@ app.all('*', (req, res) => {
 // ─── Start ───────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✓ Proxy API Gateway v3.0 running on port ${PORT}`);
+  console.log(`  Auth:       ${PROXY_PASSWORD ? 'ON (X-Proxy-Password / ?password=)' : 'OFF'}`);
   console.log(`  Health:     http://localhost:${PORT}/health`);
   console.log(`  OpenAI:     http://localhost:${PORT}/openai/v1/...`);
   console.log(`  OpenRouter: http://localhost:${PORT}/openrouter/api/v1/...`);

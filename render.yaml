@@ -10,7 +10,5 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: API_KEY
-        sync: false  # set manually in Render dashboard
-      - key: ALLOWED_ORIGINS
-        value: "*"
+      - key: PROXY_PASSWORD
+        sync: false  # задать вручную в Render (например 162162)
